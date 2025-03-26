@@ -40,6 +40,7 @@ msvc/x64
 # language servers
 **/compile_commands.json
 .cache
+.clangd
 
 # vscode settings
 .vscode

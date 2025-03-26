@@ -194,12 +194,14 @@ struct OracleFdwOption
 #define OPT_PREFETCH "prefetch"
 #define OPT_LOB_PREFETCH "lob_prefetch"
 #define OPT_SET_TIMEZONE "set_timezone"
+#define OPT_DATE_TIMEZONE "date_timezone"
 /* these options are only for IMPORT FOREIGN SCHEMA */
 #define OPT_CASE "case"
 #define OPT_COLLATION "collation"
 #define OPT_SKIP_TABLES "skip_tables"
 #define OPT_SKIP_VIEWS "skip_views"
 #define OPT_SKIP_MATVIEWS "skip_matviews"
+#define OPT_DATE_AS_TIMESTAMPTZ "date_as_timestamptz"
 
 #define DEFAULT_ISOLATION_LEVEL ORA_TRANS_SERIALIZABLE
 #define DEFAULT_MAX_LONG 32767
@@ -232,7 +234,8 @@ static struct OracleFdwOption valid_options[] = {
 	{OPT_LOB_PREFETCH, ForeignTableRelationId, false},
 	{OPT_KEY, AttributeRelationId, false},
 	{OPT_STRIP_ZEROS, AttributeRelationId, false},
-	{OPT_SET_TIMEZONE, ForeignServerRelationId, false}
+	{OPT_SET_TIMEZONE, ForeignServerRelationId, false},
+	{OPT_DATE_TIMEZONE, ForeignServerRelationId, false}
 };
 
 #define option_count (sizeof(valid_options)/sizeof(struct OracleFdwOption))
@@ -260,6 +263,7 @@ struct OracleFdwState {
 	char *password;                /* Oracle password */
 	char *nls_lang;                /* Oracle locale information */
 	char *timezone;                /* session time zone */
+	char *date_timezone;           /* time zone for date (Oracle) to timestamptz (Postgres) conversion (and back) */
 	bool have_nchar;               /* needs support for national character conversion */
 	oracleSession *session;        /* encapsulates the active Oracle session */
 	char *query;                   /* query we issue against Oracle */
@@ -375,8 +379,9 @@ static List *build_tlist_to_deparse(RelOptInfo *foreignrel);
 static struct oraTable *build_join_oratable(struct OracleFdwState *fdwState, List *fdw_scan_tlist);
 #endif  /* JOIN_API */
 static void getColumnData(Oid foreigntableid, struct oraTable *oraTable);
+static void adjustConvertedColumns(struct oraTable *oraTable, bool hasDateTimezone);
 static int acquireSampleRowsFunc (Relation relation, int elevel, HeapTuple *rows, int targrows, double *totalrows, double *totaldeadrows);
-static void appendAsType(StringInfoData *dest, const char *s, Oid type);
+static void appendAsType(StringInfoData *dest, const char *s, Oid type, oraType target_type, char* timezone);
 static char *deparseExpr(oracleSession *session, RelOptInfo *foreignrel, Expr *expr, const struct oraTable *oraTable, List **params, bool check_only);
 static char *datumToString(Datum datum, Oid type);
 static void getUsedColumns(Expr *expr, struct oraTable *oraTable, int foreignrelid);
@@ -627,6 +632,19 @@ oracle_fdw_validator(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
 						errmsg("invalid value for option \"%s\"", def->defname),
 						errhint("Valid values in this context are integers between 0 and 536870912.")));
+		}
+		
+		/* check valid values for "lob_prefetch" */
+		if (strcmp(def->defname, OPT_DATE_TIMEZONE) == 0)
+		{
+			char *val = strVal(def->arg);
+
+			errno = 0;
+			if (val[0] == '\0' || errno != 0  )
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
+						errmsg("invalid value for option \"%s\"", def->defname),
+						errhint("Empty values are not allowed")));
 		}
 	}
 
@@ -1791,7 +1809,8 @@ oraclePlanForeignModify(PlannerInfo *root, ModifyTable *plan, Index resultRelati
 					appendStringInfo(&sql, " AND");
 
 				appendStringInfo(&sql, " %s = ", fdwState->oraTable->cols[i]->name);
-				appendAsType(&sql, paramName, fdwState->oraTable->cols[i]->pgtype);
+				appendAsType(&sql, paramName, fdwState->oraTable->cols[i]->pgtype, 
+					fdwState->oraTable->cols[i]->oratype, fdwState->date_timezone);
 			}
 		}
 	}
@@ -2280,7 +2299,7 @@ oracleImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	Oid collation = DEFAULT_COLLATION_OID;
 	oraIsoLevel isolation_level_val = DEFAULT_ISOLATION_LEVEL;
 	bool have_nchar = false, skip_tables = false, skip_views = false,
-		 skip_matviews = false;
+		 skip_matviews = false, date_as_timestamptz = false;
 
 	/* get the foreign server, the user mapping and the FDW */
 	server = GetForeignServer(serverOid);
@@ -2432,20 +2451,24 @@ oracleImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		}
 		else if (strcmp(def->defname, OPT_SET_TIMEZONE) == 0)
 			set_timezone = getBoolVal(def);
+		else if (strcmp(def->defname, OPT_DATE_TIMEZONE) == 0)
+			; //TODO ?
 		else if (strcmp(def->defname, OPT_SKIP_TABLES) == 0)
 			skip_tables = getBoolVal(def);
 		else if (strcmp(def->defname, OPT_SKIP_VIEWS) == 0)
 			skip_views = getBoolVal(def);
 		else if (strcmp(def->defname, OPT_SKIP_MATVIEWS) == 0)
 			skip_matviews = getBoolVal(def);
+		else if (strcmp(def->defname, OPT_DATE_AS_TIMESTAMPTZ) == 0)
+			date_as_timestamptz = getBoolVal(def);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 					errmsg("invalid option \"%s\"", def->defname),
-					errhint("Valid options in this context are: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s",
+					errhint("Valid options in this context are: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s",
 						OPT_CASE, OPT_COLLATION, OPT_READONLY, OPT_DBLINK,
 						OPT_MAX_LONG, OPT_SAMPLE, OPT_PREFETCH, OPT_LOB_PREFETCH,
-						OPT_SET_TIMEZONE, OPT_SKIP_TABLES, OPT_SKIP_VIEWS, OPT_SKIP_MATVIEWS)));
+						OPT_SET_TIMEZONE, OPT_DATE_TIMEZONE, OPT_SKIP_TABLES, OPT_SKIP_VIEWS, OPT_SKIP_MATVIEWS, OPT_DATE_AS_TIMESTAMPTZ)));
 	}
 
 	/* if LIMIT TO is used, compose a list of quoted, upper case table names */
@@ -2640,10 +2663,18 @@ oracleImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					appendStringInfo(&buf, "bytea");
 					break;
 				case ORA_TYPE_DATE:
-					appendStringInfo(&buf, "timestamp(0) without time zone");
+					if (date_as_timestamptz) {
+						appendStringInfo(&buf, "timestamp(0) with time zone");
+					} else {
+						appendStringInfo(&buf, "timestamp(0) without time zone");
+					}
 					break;
 				case ORA_TYPE_TIMESTAMP:
-					appendStringInfo(&buf, "timestamp(%d) without time zone", (typescale > 6) ? 6 : typescale);
+					if (date_as_timestamptz) {
+						appendStringInfo(&buf, "timestamp(%d) with time zone", (typescale > 6) ? 6 : typescale);
+					} else {
+						appendStringInfo(&buf, "timestamp(%d) without time zone", (typescale > 6) ? 6 : typescale);
+					}
 					break;
 				case ORA_TYPE_TIMESTAMPTZ:
 				case ORA_TYPE_TIMESTAMPLTZ:
@@ -2745,6 +2776,8 @@ struct OracleFdwState
 			nchar = getBoolVal(def);
 		if (strcmp(def->defname, OPT_SET_TIMEZONE) == 0)
 			set_timezone = getBoolVal(def);
+		if (strcmp(def->defname, OPT_DATE_TIMEZONE) == 0)
+			fdwState->date_timezone = strVal(def->arg);
 	}
 
 	/* set isolation_level (or use default) */
@@ -2819,6 +2852,9 @@ struct OracleFdwState
 
 	/* add PostgreSQL data to table description */
 	getColumnData(foreigntableid, fdwState->oraTable);
+	
+	/* adjust some column attributes that depend on context (like type conversions) */
+	adjustConvertedColumns(fdwState->oraTable, fdwState->date_timezone != NULL);
 
 	return fdwState;
 }
@@ -2920,6 +2956,27 @@ getColumnData(Oid foreigntableid, struct oraTable *oraTable)
 }
 
 /*
+ * adjustConvertedColumns
+ * 		Adjusts attirubutes of columns that will undergo conversions
+ * 		E.g. value length of dates converted to timestamps with time zone
+ */
+void
+adjustConvertedColumns(struct oraTable *oraTable, bool hasDateTimezone)
+{
+	/* loop through foreign table columns */
+	for (int i=0; i<oraTable->ncols; ++i)
+	{
+		/* increase length of column values as they are gonna be presented as timestamps. If not, the value is gonna be truncated */
+		if (hasDateTimezone 
+			&& (oraTable->cols[i]->oratype == ORA_TYPE_DATE || oraTable->cols[i]->oratype == ORA_TYPE_TIMESTAMP) 
+			&& oraTable->cols[i]->pgtype == TIMESTAMPTZOID) 
+		{
+			oraTable->cols[i]->val_size = ORA_TYPE_TIMESTAMPTZ_LEN;
+		}
+	}
+}
+
+/*
  * createQuery
  * 		Construct a query string for Oracle that
  * 		a) contains only the necessary columns in the SELECT list
@@ -2940,6 +2997,7 @@ char
 	StringInfoData query, result;
 	List *columnlist,
 		*conditions = foreignrel->baserestrictinfo;
+	StringInfoData date_timezone_cast, ts_timezone_cast;
 
 #if PG_VERSION_NUM < 90600
 	columnlist = foreignrel->reltargetlist;
@@ -2965,6 +3023,17 @@ char
 			getUsedColumns((Expr *)lfirst(cell), fdwState->oraTable, foreignrel->relid);
 		}
 	}
+	
+	// initialize date to timestamptz cast expression with the sprecifier time zone
+	initStringInfo(&date_timezone_cast);	
+	if (fdwState->date_timezone) {
+		appendStringInfo(&date_timezone_cast, "%%sFROM_TZ(CAST(%%s%%s AS TIMESTAMP), '%s')", fdwState->date_timezone);
+	}
+	
+	initStringInfo(&ts_timezone_cast);	
+	if (fdwState->date_timezone) {
+		appendStringInfo(&ts_timezone_cast, "%%sFROM_TZ(%%s%%s, '%s')", fdwState->date_timezone);
+	}
 
 	/* construct SELECT list */
 	initStringInfo(&query);
@@ -2986,6 +3055,12 @@ char
 			else if (fdwState->oraTable->cols[i]->oratype == ORA_TYPE_TIMESTAMPLTZ)
 				/* convert TIMESTAMP WITH LOCAL TIME ZONE to TIMESTAMP WITH TIME ZONE */
 				format = "%s(%s%s AT TIME ZONE sessiontimezone)";
+			else if (fdwState->oraTable->cols[i]->oratype == ORA_TYPE_DATE && fdwState->oraTable->cols[i]->pgtype == TIMESTAMPTZOID && date_timezone_cast.len != 0)
+				/* convert DATE to TIMESTAMP WITH TIME ZONE */
+				format = date_timezone_cast.data;
+			else if (fdwState->oraTable->cols[i]->oratype == ORA_TYPE_TIMESTAMP && fdwState->oraTable->cols[i]->pgtype == TIMESTAMPTZOID && ts_timezone_cast.len != 0)
+				/* convert TIMESTAMP to TIMESTAMP WITH TIME ZONE */
+				format = ts_timezone_cast.data;
 			else if (fdwState->oraTable->cols[i]->oratype == ORA_TYPE_NCLOB)
 				format = "%sTO_CLOB(%s%s)";
 			else
@@ -3065,6 +3140,8 @@ char
 	initStringInfo(&result);
 	appendStringInfo(&result, "SELECT /*%s*/ %s", hash_str, query.data);
 	pfree(query.data);
+	pfree(date_timezone_cast.data);
+	pfree(ts_timezone_cast.data);
 
 	return result.data;
 }
@@ -3422,6 +3499,7 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	fdwState->password = fdwState_o->password;
 	fdwState->nls_lang = fdwState_o->nls_lang;
 	fdwState->timezone = fdwState_o->timezone;
+	fdwState->date_timezone = fdwState_o->date_timezone;
 	fdwState->have_nchar = fdwState_o->have_nchar;
 
 	foreach(lc, pull_var_clause((Node *)joinrel->reltarget->exprs, PVC_RECURSE_PLACEHOLDERS))
@@ -3778,7 +3856,7 @@ acquireSampleRowsFunc(Relation relation, int elevel, HeapTuple *rows, int targro
  * 		Append "s" to "dest", adding appropriate casts for datetime "type".
  */
 void
-appendAsType(StringInfoData *dest, const char *s, Oid type)
+appendAsType(StringInfoData *dest, const char *s, Oid type, oraType target_type, char* timezone)
 {
 	switch (type)
 	{
@@ -3789,7 +3867,11 @@ appendAsType(StringInfoData *dest, const char *s, Oid type)
 			appendStringInfo(dest, "CAST (%s AS TIMESTAMP)", s);
 			break;
 		case TIMESTAMPTZOID:
-			appendStringInfo(dest, "CAST (%s AS TIMESTAMP WITH TIME ZONE)", s);
+			if (timezone &&(target_type == ORA_TYPE_DATE || target_type == ORA_TYPE_TIMESTAMP)) {
+				appendStringInfo(dest, "CAST (%s AS TIMESTAMP WITH TIME ZONE) AT TIME ZONE '%s'", s, timezone);
+			} else {
+				appendStringInfo(dest, "CAST (%s AS TIMESTAMP WITH TIME ZONE)", s);
+			}
 			break;
 		default:
 			appendStringInfo(dest, "%s", s);
@@ -3914,7 +3996,7 @@ deparseExpr(oracleSession *session, RelOptInfo *foreignrel, Expr *expr, const st
 			/* parameters will be called :p1, :p2 etc. */
 			snprintf(parname, 10, ":p%d", index);
 			initStringInfo(&result);
-			appendAsType(&result, parname, param->paramtype);
+			appendAsType(&result, parname, param->paramtype, (oraType)0, NULL); // FIXME: does this need timezone conversion?
 
 			break;
 		case T_Var:
@@ -4865,8 +4947,8 @@ static char
 		case TIMESTAMPTZOID:
 			str = deparseTimestamp(datum, true);
 			initStringInfo(&result);
-			appendStringInfo(&result, "(CAST ('%s' AS TIMESTAMP WITH TIME ZONE))", str);
-			break;
+							appendStringInfo(&result, "(CAST ('%s' AS TIMESTAMP WITH TIME ZONE))", str);
+						break;
 		case INTERVALOID:
 			str = deparseInterval(datum);
 			if (str == NULL)
@@ -5487,6 +5569,8 @@ oracleConnectServer(Name srvname)
 			have_nchar = getBoolVal(def);
 		if (strcmp(def->defname, OPT_SET_TIMEZONE) == 0 && getBoolVal(def))
 			timezone = getTimezone();
+		if (strcmp(def->defname, OPT_DATE_TIMEZONE) == 0)
+			; //TODO ?
 	}
 
 	/* guess a good NLS_LANG environment setting */
@@ -5537,6 +5621,8 @@ List
 	result = lappend(result, serializeString(fdwState->nls_lang));
 	/* timezone */
 	result = lappend(result, serializeString(fdwState->timezone));
+	/* date_timezone */
+	result = lappend(result, serializeString(fdwState->date_timezone));
 	/* query */
 	result = lappend(result, serializeString(fdwState->query));
 	/* Oracle prefetch count */
@@ -5657,6 +5743,10 @@ struct OracleFdwState
 
 	/* timezone */
 	state->timezone = deserializeString(lfirst(cell));
+	cell = list_next(list, cell);
+	
+	/* date_timezone */
+	state->date_timezone = deserializeString(lfirst(cell));
 	cell = list_next(list, cell);
 
 	/* query */
@@ -5950,6 +6040,10 @@ struct OracleFdwState
 		copy->timezone = NULL;
 	else
 		copy->timezone = pstrdup(orig->timezone);
+	if (orig->date_timezone == NULL)
+		copy->date_timezone = NULL;
+	else
+		copy->date_timezone = pstrdup(orig->date_timezone);
 	copy->session = NULL;
 	copy->query = NULL;
 	copy->paramList = NULL;
@@ -6328,7 +6422,8 @@ buildInsertQuery(StringInfo sql, struct OracleFdwState *fdwState)
 		else
 			appendStringInfo(sql, ", ");
 
-		appendAsType(sql, paramName, fdwState->oraTable->cols[i]->pgtype);
+		appendAsType(sql, paramName, fdwState->oraTable->cols[i]->pgtype, 
+			fdwState->oraTable->cols[i]->oratype, fdwState->date_timezone);
 	}
 
 	appendStringInfo(sql, ")");
@@ -6379,7 +6474,8 @@ buildUpdateQuery(StringInfo sql, struct OracleFdwState *fdwState, List *targetAt
 			appendStringInfo(sql, ", ");
 
 		appendStringInfo(sql, "%s = ", fdwState->oraTable->cols[i]->name);
-		appendAsType(sql, paramName, fdwState->oraTable->cols[i]->pgtype);
+		appendAsType(sql, paramName, fdwState->oraTable->cols[i]->pgtype, 
+			fdwState->oraTable->cols[i]->oratype, fdwState->date_timezone);
 	}
 
 	/* throw a meaningful error if nothing is updated */
@@ -6397,6 +6493,18 @@ appendReturningClause(StringInfo sql, struct OracleFdwState *fdwState)
 	bool firstcol;
 	struct paramDesc *param;
 	char paramName[10];
+	StringInfoData date_timezone_cast, ts_timezone_cast;
+	
+	// initialize date to timestamptz cast expression with the sprecifier time zone
+	initStringInfo(&date_timezone_cast);	
+	if (fdwState->date_timezone) {
+		appendStringInfo(&date_timezone_cast, "FROM_TZ(CAST(%%s AS TIMESTAMP), '%s')", fdwState->date_timezone);
+	}
+	initStringInfo(&ts_timezone_cast);	
+	if (fdwState->date_timezone) {
+		appendStringInfo(&ts_timezone_cast, "FROM_TZ(%%s, '%s')", fdwState->date_timezone);
+	}
+
 
 	/* add the RETURNING clause itself */
 	firstcol = true;
@@ -6411,10 +6519,22 @@ appendReturningClause(StringInfo sql, struct OracleFdwState *fdwState)
 			else
 				appendStringInfo(sql, ", ");
 			if (fdwState->oraTable->cols[i]->oratype == ORA_TYPE_XMLTYPE)
-				appendStringInfo(sql, "(%s).getclobval()", fdwState->oraTable->cols[i]->name);
+				appendStringInfo(sql, "(%s).getclobval()", fdwState->oraTable->cols[i]->name);		
+			else if (fdwState->oraTable->cols[i]->oratype == ORA_TYPE_TIMESTAMPLTZ)
+				/* convert TIMESTAMP WITH LOCAL TIME ZONE to TIMESTAMP WITH TIME ZONE */
+				appendStringInfo(sql, "(%s AT TIME ZONE sessiontimezone)", fdwState->oraTable->cols[i]->name);
+			else if (fdwState->oraTable->cols[i]->oratype == ORA_TYPE_DATE && fdwState->oraTable->cols[i]->pgtype == TIMESTAMPTZOID && date_timezone_cast.len != 0)
+				/* convert DATE to TIMESTAMP WITH TIME ZONE */
+				appendStringInfo(sql, date_timezone_cast.data, fdwState->oraTable->cols[i]->name);
+			else if (fdwState->oraTable->cols[i]->oratype == ORA_TYPE_TIMESTAMP && fdwState->oraTable->cols[i]->pgtype == TIMESTAMPTZOID && ts_timezone_cast.len != 0)
+				/* convert TIMESTAMP to TIMESTAMP WITH TIME ZONE */
+				appendStringInfo(sql, ts_timezone_cast.data, fdwState->oraTable->cols[i]->name);
 			else
 				appendStringInfo(sql, "%s", fdwState->oraTable->cols[i]->name);
 		}
+		
+	pfree(date_timezone_cast.data);
+	pfree(ts_timezone_cast.data);
 
 	/* add the parameters for the RETURNING clause */
 	firstcol = true;
@@ -6870,6 +6990,8 @@ convertTuple(struct OracleFdwState *fdw_state, unsigned int index, Datum *values
 			/* uninstall error context callback */
 			error_context_stack = errcb.previous;
 		}
+		
+		// ereport(WARNING, (errcode(ERRCODE_WARNING), errmsg("Oracle value is \"%s\"", value)));
 
 		/* free the data buffer for LOBs */
 		if (fdw_state->oraTable->cols[i]->oratype == ORA_TYPE_BLOB
