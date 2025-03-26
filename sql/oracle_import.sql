@@ -44,7 +44,7 @@ IMPORT FOREIGN SCHEMA "SCOTT"
    LIMIT TO (typetest3)
    FROM SERVER oracle
    INTO import
-   OPTIONS (date_as_timestamptz 'true');
+   OPTIONS (date_as_timestamptz 'true', timestamp_as_timestamptz 'true');
 
 SELECT t.relname, a.attname, a.atttypid::regtype, a.attfdwoptions
 FROM pg_attribute AS a

@@ -202,6 +202,7 @@ struct OracleFdwOption
 #define OPT_SKIP_VIEWS "skip_views"
 #define OPT_SKIP_MATVIEWS "skip_matviews"
 #define OPT_DATE_AS_TIMESTAMPTZ "date_as_timestamptz"
+#define OPT_TIMESTAMP_AS_TIMESTAMPTZ "timestamp_as_timestamptz"
 
 #define DEFAULT_ISOLATION_LEVEL ORA_TRANS_SERIALIZABLE
 #define DEFAULT_MAX_LONG 32767
@@ -2299,7 +2300,8 @@ oracleImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	Oid collation = DEFAULT_COLLATION_OID;
 	oraIsoLevel isolation_level_val = DEFAULT_ISOLATION_LEVEL;
 	bool have_nchar = false, skip_tables = false, skip_views = false,
-		 skip_matviews = false, date_as_timestamptz = false;
+		 skip_matviews = false, has_date_timezone = false,
+		 date_as_timestamptz = false, timestamp_as_timestamptz = false;
 
 	/* get the foreign server, the user mapping and the FDW */
 	server = GetForeignServer(serverOid);
@@ -2316,16 +2318,18 @@ oracleImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		DefElem *def = (DefElem *) lfirst(cell);
 		if (strcmp(def->defname, OPT_NLS_LANG) == 0)
 			nls_lang = strVal(def->arg);
-		if (strcmp(def->defname, OPT_DBSERVER) == 0)
+		else if (strcmp(def->defname, OPT_DBSERVER) == 0)
 			dbserver = strVal(def->arg);
-		if (strcmp(def->defname, OPT_ISOLATION_LEVEL) == 0)
+		else if (strcmp(def->defname, OPT_ISOLATION_LEVEL) == 0)
 			isolation_level_val = getIsolationLevel(strVal(def->arg));
-		if (strcmp(def->defname, OPT_USER) == 0)
+		else if (strcmp(def->defname, OPT_USER) == 0)
 			user = (strVal(def->arg));
-		if (strcmp(def->defname, OPT_PASSWORD) == 0)
+		else if (strcmp(def->defname, OPT_PASSWORD) == 0)
 			password = strVal(def->arg);
-		if (strcmp(def->defname, OPT_NCHAR) == 0)
+		else if (strcmp(def->defname, OPT_NCHAR) == 0)
 			have_nchar = getBoolVal(def);
+		else if (strcmp(def->defname, OPT_DATE_TIMEZONE) == 0)
+			has_date_timezone = true;
 	}
 
 	/* process the options of the IMPORT FOREIGN SCHEMA command */
@@ -2451,8 +2455,6 @@ oracleImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		}
 		else if (strcmp(def->defname, OPT_SET_TIMEZONE) == 0)
 			set_timezone = getBoolVal(def);
-		else if (strcmp(def->defname, OPT_DATE_TIMEZONE) == 0)
-			; //TODO ?
 		else if (strcmp(def->defname, OPT_SKIP_TABLES) == 0)
 			skip_tables = getBoolVal(def);
 		else if (strcmp(def->defname, OPT_SKIP_VIEWS) == 0)
@@ -2461,16 +2463,29 @@ oracleImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			skip_matviews = getBoolVal(def);
 		else if (strcmp(def->defname, OPT_DATE_AS_TIMESTAMPTZ) == 0)
 			date_as_timestamptz = getBoolVal(def);
+		else if (strcmp(def->defname, OPT_TIMESTAMP_AS_TIMESTAMPTZ) == 0)
+			timestamp_as_timestamptz = getBoolVal(def);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 					errmsg("invalid option \"%s\"", def->defname),
-					errhint("Valid options in this context are: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s",
+					errhint("Valid options in this context are: %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s",
 						OPT_CASE, OPT_COLLATION, OPT_READONLY, OPT_DBLINK,
 						OPT_MAX_LONG, OPT_SAMPLE, OPT_PREFETCH, OPT_LOB_PREFETCH,
-						OPT_SET_TIMEZONE, OPT_DATE_TIMEZONE, OPT_SKIP_TABLES, OPT_SKIP_VIEWS, OPT_SKIP_MATVIEWS, OPT_DATE_AS_TIMESTAMPTZ)));
+						OPT_SET_TIMEZONE, OPT_DATE_TIMEZONE, OPT_SKIP_TABLES, OPT_SKIP_VIEWS, OPT_SKIP_MATVIEWS, 
+						OPT_DATE_AS_TIMESTAMPTZ, OPT_TIMESTAMP_AS_TIMESTAMPTZ)));
 	}
-
+	
+	if (!has_date_timezone && (date_as_timestamptz || timestamp_as_timestamptz)) {
+		ereport(WARNING,
+			(errcode(ERRCODE_WARNING),
+			errmsg("Foreign server does not have `date_timezone` option set. "
+					"Time zone information will be lost on conversion. "
+					"Date/timestamp values will most probably be incorrect."),
+			errhint("Set `date_timezone` server option to a valid Oracle time zone or remove `date_as_timestamptz` and `timestamp_as_timestamptz` "
+					"options from IMPORT FOREIGN SCHEMA command")));
+	}
+	
 	/* if LIMIT TO is used, compose a list of quoted, upper case table names */
 	if (stmt->list_type == FDW_IMPORT_SCHEMA_LIMIT_TO)
 	{
@@ -2670,7 +2685,7 @@ oracleImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					}
 					break;
 				case ORA_TYPE_TIMESTAMP:
-					if (date_as_timestamptz) {
+					if (timestamp_as_timestamptz) {
 						appendStringInfo(&buf, "timestamp(%d) with time zone", (typescale > 6) ? 6 : typescale);
 					} else {
 						appendStringInfo(&buf, "timestamp(%d) without time zone", (typescale > 6) ? 6 : typescale);

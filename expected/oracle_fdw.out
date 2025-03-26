@@ -1074,3 +1074,4 @@ SELECT * FROM typetest3_raw ORDER BY id;
   2 | Thu Dec 31 03:00:00 2020 | Thu Dec 31 03:00:00 2020
   3 | Thu Dec 31 05:30:00 2020 | Thu Dec 31 05:30:00 2020
 (3 rows)
+

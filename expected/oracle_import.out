@@ -79,7 +79,7 @@ IMPORT FOREIGN SCHEMA "SCOTT"
    LIMIT TO (typetest3)
    FROM SERVER oracle
    INTO import
-   OPTIONS (date_as_timestamptz 'true');
+   OPTIONS (date_as_timestamptz 'true', timestamp_as_timestamptz 'true');
 SELECT t.relname, a.attname, a.atttypid::regtype, a.attfdwoptions
 FROM pg_attribute AS a
    JOIN pg_class AS t ON t.oid = a.attrelid
@@ -94,3 +94,4 @@ ORDER BY t.relname, a.attnum;
  typetest3 | d       | timestamp with time zone | 
  typetest3 | ts      | timestamp with time zone | 
 (3 rows)
+
