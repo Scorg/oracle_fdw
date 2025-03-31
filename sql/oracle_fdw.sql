@@ -715,3 +715,18 @@ CREATE FOREIGN TABLE typetest3_raw (
 ) SERVER oracle OPTIONS (table 'TYPETEST3');
 
 SELECT * FROM typetest3_raw ORDER BY id;
+
+/* check conditions on converted columns working */
+EXPLAIN(costs off)
+SELECT * FROM typetest3 WHERE d = '2020-12-31 00:00:00 UTC' ORDER BY id;
+SELECT * FROM typetest3 WHERE d = '2020-12-31 00:00:00 UTC' ORDER BY id;
+
+PREPARE stmt(integer, date, timestamp) AS SELECT d FROM typetest3 WHERE id = $1 AND d < $2 AND $3 > ts;
+-- six executions to switch to generic plan
+EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+EXPLAIN (COSTS off) EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+DEALLOCATE stmt;

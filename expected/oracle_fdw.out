@@ -1075,3 +1075,58 @@ SELECT * FROM typetest3_raw ORDER BY id;
   3 | Thu Dec 31 05:30:00 2020 | Thu Dec 31 05:30:00 2020
 (3 rows)
 
+/* check conditions on converted columns working */
+EXPLAIN(costs off)
+SELECT * FROM typetest3 WHERE d = '2020-12-31 00:00:00 UTC' ORDER BY id;
+                                                                                                                                                                QUERY PLAN                                                                                                                                                                
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on typetest3
+   Oracle query: SELECT /*11a72aeb292e958e*/ r1."ID", FROM_TZ(CAST(r1."D" AS TIMESTAMP), 'Asia/Kolkata'), FROM_TZ(r1."TS", 'Asia/Kolkata') FROM "TYPETEST3" r1 WHERE (r1."D" = CAST((CAST ('2020-12-30 16:00:00.000000-08:00 AD' AS TIMESTAMP WITH TIME ZONE)) AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP)) ORDER BY r1."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT * FROM typetest3 WHERE d = '2020-12-31 00:00:00 UTC' ORDER BY id;
+ id |              d               |              ts              
+----+------------------------------+------------------------------
+  3 | Wed Dec 30 16:00:00 2020 PST | Wed Dec 30 16:00:00 2020 PST
+(1 row)
+
+PREPARE stmt(integer, date, timestamp) AS SELECT d FROM typetest3 WHERE id = $1 AND d < $2 AND $3 > ts;
+-- six executions to switch to generic plan
+EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+              d               
+------------------------------
+ Wed Jul 31 11:30:00 2002 PDT
+(1 row)
+
+EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+              d               
+------------------------------
+ Wed Jul 31 11:30:00 2002 PDT
+(1 row)
+
+EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+              d               
+------------------------------
+ Wed Jul 31 11:30:00 2002 PDT
+(1 row)
+
+EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+              d               
+------------------------------
+ Wed Jul 31 11:30:00 2002 PDT
+(1 row)
+
+EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+              d               
+------------------------------
+ Wed Jul 31 11:30:00 2002 PDT
+(1 row)
+
+EXPLAIN (COSTS off) EXECUTE stmt(1, '2011-03-09', '2011-03-09 05:00:00');
+                                                                                                                                                                                                                            QUERY PLAN                                                                                                                                                                                                                             
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on typetest3
+   Oracle query: SELECT /*5cf4e46b38a8de85*/ r1."ID", FROM_TZ(CAST(r1."D" AS TIMESTAMP), 'Asia/Kolkata'), FROM_TZ(r1."TS", 'Asia/Kolkata') FROM "TYPETEST3" r1 WHERE (r1."D" < CAST(FROM_TZ(CAST(CAST (:p1 AS DATE) AS TIMESTAMP), 'America/Los_Angeles') AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP)) AND (CAST(FROM_TZ(CAST(CAST (:p2 AS TIMESTAMP) AS TIMESTAMP), 'America/Los_Angeles') AT TIME ZONE 'Asia/Kolkata' AS TIMESTAMP) > r1."TS") AND (r1."ID" = :p3)
+(2 rows)
+
+DEALLOCATE stmt;

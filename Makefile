@@ -30,6 +30,8 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 endif
 
+$(OBJS): CFLAGS += $(PERMIT_DECLARATION_AFTER_STATEMENT)
+
 # Oracle's shared library is oci.dll on Windows and libclntsh elsewhere
 ifeq ($(PORTNAME),win32)
 ORACLE_SHLIB=oci
